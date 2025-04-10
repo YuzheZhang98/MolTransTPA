@@ -3,17 +3,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from transformers import RobertaModel, RobertaTokenizer
+from transformers import AutoModel, AutoTokenizer
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.model_selection import train_test_split
 
 # Constants
-MAX_SEQ_LENGTH = 128
-BATCH_SIZE = 32
-LEARNING_RATE = 1e-4
-NUM_EPOCHS = 50
+MAX_SEQ_LENGTH = 512  # MolFormer supports longer sequences
+BATCH_SIZE = 16       # Reduced due to larger model size
+LEARNING_RATE = 5e-5  # Lower learning rate for fine-tuning
+NUM_EPOCHS = 30
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# MolFormer model path
+MOLFORMER_PATH = 'ibm/MolFormer'
 
 # Solvent properties - example features
 SOLVENT_FEATURES = ['polarity', 'viscosity', 'refractive_index']
@@ -30,7 +33,7 @@ class TPADataset(Dataset):
             solvent_data (pd.DataFrame): DataFrame with solvent properties
             tpa_values (list): Target TPA cross-section values
         """
-        self.tokenizer = RobertaTokenizer.from_pretrained('seyonec/MolFormer')
+        self.tokenizer = AutoTokenizer.from_pretrained('ibm/MolFormer')
         self.smiles_list = smiles_list
         self.wavelengths = wavelengths
         self.solvent_data = solvent_data
@@ -165,7 +168,7 @@ class MolFormerTPA(nn.Module):
         super().__init__()
 
         # 1. SMILES Encoding Branch - MolFormer
-        self.molformer = RobertaModel.from_pretrained('seyonec/MolFormer')
+        self.molformer = AutoModel.from_pretrained('ibm/MolFormer')
         molformer_dim = self.molformer.config.hidden_size
 
         # 2. Conditions Encoding Branch
@@ -185,7 +188,8 @@ class MolFormerTPA(nn.Module):
         # 1. SMILES Encoding
         molformer_output = self.molformer(
             input_ids=input_ids,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            return_dict=True
         )
 
         # Use CLS token as molecular representation
@@ -216,7 +220,19 @@ def train_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS):
     Returns:
         model (MolFormerTPA): Trained model
     """
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # Different learning rates for pre-trained model and new layers
+    optimizer = torch.optim.AdamW([
+        {'params': model.molformer.parameters(), 'lr': LEARNING_RATE / 10},  # Lower LR for pre-trained
+        {'params': model.condition_encoder.parameters()},
+        {'params': model.fusion.parameters()},
+        {'params': model.prediction_head.parameters()}
+    ], lr=LEARNING_RATE, weight_decay=0.01)
+
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    )
+
     criterion = nn.MSELoss()
 
     best_val_loss = float('inf')
@@ -248,6 +264,8 @@ def train_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS):
         # Validation
         model.eval()
         val_loss = 0
+        val_predictions = []
+        val_targets = []
 
         with torch.no_grad():
             for batch in val_loader:
@@ -261,10 +279,19 @@ def train_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS):
                 loss = criterion(predictions, tpa)
 
                 val_loss += loss.item()
+                val_predictions.extend(predictions.cpu().numpy())
+                val_targets.extend(tpa.cpu().numpy())
 
             val_loss /= len(val_loader)
 
-        print(f'Epoch {epoch+1}/{num_epochs} | Training Loss: {train_loss:.4f} | Validation Loss: {val_loss:.4f}')
+            # Calculate additional metrics
+            val_mae = np.mean(np.abs(np.array(val_predictions) - np.array(val_targets)))
+            val_r2 = np.corrcoef(val_predictions, val_targets)[0, 1] ** 2
+
+        print(f'Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | Val R²: {val_r2:.4f}')
+
+        # Update learning rate based on validation loss
+        scheduler.step(val_loss)
 
         # Save best model
         if val_loss < best_val_loss:
@@ -289,7 +316,7 @@ def predict_tpa(model, smiles, wavelength, solvent_properties):
         float: Predicted TPA cross-section
     """
     model.eval()
-    tokenizer = RobertaTokenizer.from_pretrained('seyonec/MolFormer')
+    tokenizer = AutoTokenizer.from_pretrained('ibm/MolFormer')
 
     # Process SMILES
     encoding = tokenizer(
@@ -326,42 +353,72 @@ def main():
     Main function to demonstrate usage
     """
     # Example data loading (replace with your actual data)
-    # In a real implementation, you would load this from files
+    # In a real implementation, you would load this from CSV files
     example_data = {
         'smiles': [
-            'CCO',
-            'CC1=CC=CC=C1',
-            'C1=CC=C(C=C1)C=O',
-            # Add more molecules
+            'CCO',  # Ethanol
+            'CC1=CC=CC=C1',  # Toluene
+            'C1=CC=C(C=C1)C=O',  # Benzaldehyde
+            'c1ccc2c(c1)C(=O)c3ccccc3C2=O',  # Anthraquinone
+            'c1cc(cc(c1)N)N',  # m-Phenylenediamine
+            'Clc1ccc2c(c1)C(=O)C3=C(C2=O)C(=CC=C3)Cl',  # 1,5-Dichloroanthraquinone
+            'C1=CC=C2C(=C1)C(=O)C3=CC=CC=C3C2=O',  # Anthracene-9,10-dione
+            'c1ccc2nc3ccccc3cc2c1',  # Acridine
+            # Add more representative molecules for TPA study
         ],
         'wavelength': [
             800,
             850,
             900,
+            750,
+            780,
+            820,
+            860,
+            880,
             # Add more wavelengths
         ],
         'solvent_type': [
             'water',
             'dmso',
             'methanol',
+            'acetone',
+            'chloroform',
+            'toluene',
+            'water',
+            'dmso',
             # Add more solvent types
         ],
         'polarity': [
-            78.4,
-            46.7,
-            32.6,
+            78.4,  # Water
+            46.7,  # DMSO
+            32.6,  # Methanol
+            20.7,  # Acetone
+            4.8,   # Chloroform
+            2.4,   # Toluene
+            78.4,  # Water
+            46.7,  # DMSO
             # Add more polarity values
         ],
         'viscosity': [
-            0.89,
-            1.99,
-            0.54,
+            0.89,  # Water
+            1.99,  # DMSO
+            0.54,  # Methanol
+            0.31,  # Acetone
+            0.56,  # Chloroform
+            0.59,  # Toluene
+            0.89,  # Water
+            1.99,  # DMSO
             # Add more viscosity values
         ],
         'tpa': [
-            15.2,
-            45.7,
-            32.1,
+            15.2,   # Example TPA values in GM units (Goeppert-Mayer)
+            45.7,   # These would be experimental values
+            32.1,   # or calculated from high-level quantum methods
+            120.5,  # Higher values for more conjugated systems
+            85.3,
+            210.7,
+            175.2,
+            95.8,
             # Add more TPA values
         ]
     }
@@ -417,6 +474,64 @@ def main():
 
     predicted_tpa = predict_tpa(trained_model, example_smiles, example_wavelength, example_solvent)
     print(f"Predicted TPA cross-section for {example_smiles} at {example_wavelength} nm: {predicted_tpa}")
+
+def save_model_for_inference(model, output_dir="./tpa_model"):
+    """
+    Save the trained model for later inference
+
+    Args:
+        model (MolFormerTPA): Trained model
+        output_dir (str): Directory to save the model
+    """
+    import os
+    import json
+
+    # Create directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save model weights
+    torch.save(model.state_dict(), os.path.join(output_dir, "model_weights.pt"))
+
+    # Save tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MOLFORMER_PATH)
+    tokenizer.save_pretrained(output_dir)
+
+    # Save configuration (for recreating the model)
+    config = {
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "molformer_path": MOLFORMER_PATH,
+    }
+
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(config, f)
+
+    print(f"Model saved to {output_dir}")
+
+def load_model_for_inference(model_dir, solvent_dim):
+    """
+    Load a saved model for inference
+
+    Args:
+        model_dir (str): Directory containing the saved model
+        solvent_dim (int): Dimension of solvent features
+
+    Returns:
+        model (MolFormerTPA): Loaded model
+    """
+    import os
+    import json
+
+    # Load configuration
+    with open(os.path.join(model_dir, "config.json"), "r") as f:
+        config = json.load(f)
+
+    # Initialize model
+    model = MolFormerTPA(solvent_dim=solvent_dim)
+
+    # Load weights
+    model.load_state_dict(torch.load(os.path.join(model_dir, "model_weights.pt")))
+
+    return model.to(DEVICE)
 
 if __name__ == "__main__":
     main()
