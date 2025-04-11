@@ -1,3 +1,15 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from transformers import AutoModel, AutoTokenizer
+import pandas as pd
+import json
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from torch.cuda.amp import autocast, GradScaler  # For mixed precision training
+
 def load_data(json_file):
     """
     Load data from a JSON file
@@ -18,7 +30,7 @@ def main():
     """
     # Load data from JSON file
     # Replace with your actual JSON file path
-    data_file = "tpa_data.json"
+    data_file = "TPA_cleaned_data.json"
 
     try:
         all_data = load_data(data_file)
@@ -111,17 +123,6 @@ def main():
     )
 
     print("Model training complete and saved to ./tpa_model")
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from transformers import AutoModel, AutoTokenizer
-import pandas as pd
-import json
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from torch.cuda.amp import autocast, GradScaler  # For mixed precision training
 
 # Constants
 MAX_SEQ_LENGTH = 512  # MolFormer supports longer sequences
@@ -132,14 +133,10 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 USE_MIXED_PRECISION = torch.cuda.is_available()  # Use mixed precision if GPU is available
 
 # MolFormer model path
-MOLFORMER_PATH = 'ibm/MolFormer'
+MOLFORMER_PATH = 'ibm-research/MoLFormer-XL-both-10pct'
 
 # Solvent properties
 SOLVENT_FEATURES = ['ET(30)', 'dielectic constant', 'dipole moment']
-
-# Solvent properties - example features
-SOLVENT_FEATURES = ['polarity', 'viscosity', 'refractive_index']
-CATEGORICAL_SOLVENTS = ['water', 'methanol', 'dmso', 'acetone', 'chloroform', 'toluene']
 
 class TPADataset(Dataset):
     def __init__(self, data_list, is_train=True):
@@ -151,7 +148,8 @@ class TPADataset(Dataset):
                               wavelength, and TPA cross-section values
             is_train (bool): Whether this is training data (for scaling)
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(MOLFORMER_PATH)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(MOLFORMER_PATH, trust_remote_code=True)
         self.data = data_list
         self.is_train = is_train
 
@@ -280,7 +278,7 @@ class MolFormerTPA(nn.Module):
         super().__init__()
 
         # 1. SMILES Encoding Branch - MolFormer
-        self.molformer = AutoModel.from_pretrained(MOLFORMER_PATH)
+        self.molformer = AutoModel.from_pretrained(MOLFORMER_PATH, trust_remote_code=True)
         molformer_dim = self.molformer.config.hidden_size
 
         # 2. Conditions Encoding Branch
@@ -418,14 +416,10 @@ def train_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS):
             best_val_loss = val_loss
             torch.save(model.state_dict(), 'molformer_tpa_best.pt')
 
-    # Load best model
-    model.load_state_dict(torch.load('molformer_tpa_best.pt'))
-    return model
-
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), 'molformer_tpa_best.pt')
+    # Save best model
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), 'molformer_tpa_best.pt')
 
     # Load best model
     model.load_state_dict(torch.load('molformer_tpa_best.pt'))
@@ -445,7 +439,7 @@ def predict_tpa(model, smiles, wavelength, solvent_properties):
         float: Predicted TPA cross-section
     """
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained('ibm/MolFormer')
+    tokenizer = AutoTokenizer.from_pretrained(MOLFORMER_PATH, trust_remote_code=True)
 
     # Process SMILES
     encoding = tokenizer(
@@ -477,133 +471,6 @@ def predict_tpa(model, smiles, wavelength, solvent_properties):
 
     return prediction.item()
 
-def main():
-    """
-    Main function to demonstrate usage
-    """
-    # Example data loading (replace with your actual data)
-    # In a real implementation, you would load this from CSV files
-    example_data = {
-        'smiles': [
-            'CCO',  # Ethanol
-            'CC1=CC=CC=C1',  # Toluene
-            'C1=CC=C(C=C1)C=O',  # Benzaldehyde
-            'c1ccc2c(c1)C(=O)c3ccccc3C2=O',  # Anthraquinone
-            'c1cc(cc(c1)N)N',  # m-Phenylenediamine
-            'Clc1ccc2c(c1)C(=O)C3=C(C2=O)C(=CC=C3)Cl',  # 1,5-Dichloroanthraquinone
-            'C1=CC=C2C(=C1)C(=O)C3=CC=CC=C3C2=O',  # Anthracene-9,10-dione
-            'c1ccc2nc3ccccc3cc2c1',  # Acridine
-            # Add more representative molecules for TPA study
-        ],
-        'wavelength': [
-            800,
-            850,
-            900,
-            750,
-            780,
-            820,
-            860,
-            880,
-            # Add more wavelengths
-        ],
-        'solvent_type': [
-            'water',
-            'dmso',
-            'methanol',
-            'acetone',
-            'chloroform',
-            'toluene',
-            'water',
-            'dmso',
-            # Add more solvent types
-        ],
-        'polarity': [
-            78.4,  # Water
-            46.7,  # DMSO
-            32.6,  # Methanol
-            20.7,  # Acetone
-            4.8,   # Chloroform
-            2.4,   # Toluene
-            78.4,  # Water
-            46.7,  # DMSO
-            # Add more polarity values
-        ],
-        'viscosity': [
-            0.89,  # Water
-            1.99,  # DMSO
-            0.54,  # Methanol
-            0.31,  # Acetone
-            0.56,  # Chloroform
-            0.59,  # Toluene
-            0.89,  # Water
-            1.99,  # DMSO
-            # Add more viscosity values
-        ],
-        'tpa': [
-            15.2,   # Example TPA values in GM units (Goeppert-Mayer)
-            45.7,   # These would be experimental values
-            32.1,   # or calculated from high-level quantum methods
-            120.5,  # Higher values for more conjugated systems
-            85.3,
-            210.7,
-            175.2,
-            95.8,
-            # Add more TPA values
-        ]
-    }
-
-    # Convert to DataFrame
-    df = pd.DataFrame(example_data)
-
-    # Split data
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-
-    # Create datasets
-    train_dataset = TPADataset(
-        train_df['smiles'].tolist(),
-        train_df['wavelength'].tolist(),
-        train_df[['solvent_type', 'polarity', 'viscosity']],
-        train_df['tpa'].tolist()
-    )
-
-    test_dataset = TPADataset(
-        test_df['smiles'].tolist(),
-        test_df['wavelength'].tolist(),
-        test_df[['solvent_type', 'polarity', 'viscosity']],
-        test_df['tpa'].tolist()
-    )
-
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
-
-    # Determine solvent dimension from dataset
-    sample = next(iter(train_loader))
-    solvent_dim = sample['solvent'].shape[1]
-
-    # Initialize model
-    model = MolFormerTPA(solvent_dim=solvent_dim).to(DEVICE)
-
-    # Train model
-    trained_model = train_model(model, train_loader, test_loader)
-
-    # Example prediction
-    example_smiles = 'CCO'  # Ethanol
-    example_wavelength = 800  # nm
-    example_solvent = {
-        'solvent_type_water': 1,  # One-hot encoded
-        'solvent_type_methanol': 0,
-        'solvent_type_dmso': 0,
-        'solvent_type_acetone': 0,
-        'solvent_type_chloroform': 0,
-        'solvent_type_toluene': 0,
-        'polarity': 78.4,
-        'viscosity': 0.89
-    }
-
-    predicted_tpa = predict_tpa(trained_model, example_smiles, example_wavelength, example_solvent)
-    print(f"Predicted TPA cross-section for {example_smiles} at {example_wavelength} nm: {predicted_tpa}")
-
 def save_model_for_inference(model, condition_scaler, output_dir="./tpa_model"):
     """
     Save the trained model for later inference
@@ -624,7 +491,7 @@ def save_model_for_inference(model, condition_scaler, output_dir="./tpa_model"):
     torch.save(model.state_dict(), os.path.join(output_dir, "model_weights.pt"))
 
     # Save tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MOLFORMER_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(MOLFORMER_PATH, trust_remote_code=True)
     tokenizer.save_pretrained(output_dir)
 
     # Save condition scaler
