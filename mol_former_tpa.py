@@ -32,6 +32,10 @@ class MolFormerTPA(nn.Module):
         # 4. Prediction Head
         self.prediction_head = TPAPredictionHead(input_dim=256)
 
+    def change_molformer(self, train_molformer=True):
+        for param in self.molformer.parameters():
+            param.requires_grad = train_molformer
+
     def forward(self, input_ids, attention_mask, condition, labels=None):
         # 1. SMILES Encoding
         with autocast(device_type=str(DEVICE), enabled=False):
