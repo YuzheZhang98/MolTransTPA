@@ -1,274 +1,307 @@
+import os
+import argparse
+import logging
+import json
 import torch
 import wandb
-import os
-import logging
-from torch.utils.data import DataLoader
-from transformers import TrainingArguments, Trainer
-from transformers.trainer_utils import get_last_checkpoint
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+
 from dataset import TPADataset
-from mol_former_tpa import MolFormerTPA
+from mol_former_tpa import MolFormerTPA, predict_tpacs
+from training import (
+    train_with_early_stopping, 
+    evaluate_model, 
+    load_data, 
+    get_example_data
+)
+
 from constants import (
     BATCH_SIZE, 
     LEARNING_RATE, 
     FROZEN_NUM_EPOCHS, 
     FT_NUM_EPOCHS, 
     DEVICE, 
-    USE_MIXED_PRECISION
+    USE_MIXED_PRECISION,
+    OUTPUT_DIR,
+    LOGGING_DIR,
+    RANDOM_SEED
 )
-import json
 
-# Define additional constants with default values
-OUTPUT_DIR = '/home/zhang2539/former_results'
-LOGGING_DIR = './logs'
-LOGGING_STEPS = 10
-EVAL_STEPS = 500
-SAVE_STEPS = 500
-RANDOM_SEED = 42
-
-# Set up logging
-try:
-    os.makedirs(LOGGING_DIR, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(os.path.join(LOGGING_DIR, "training.log")),
-            logging.StreamHandler()
-        ]
-    )
-except Exception:
-    # Fallback to basic logging if file cannot be created
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+os.makedirs(LOGGING_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOGGING_DIR, "main.log")),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
-def load_data(json_file):
-    """Load data from a JSON file"""
-    try:
-        with open(json_file, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error(f"File {json_file} not found.")
-        return None
-    except json.JSONDecodeError:
-        logger.error(f"Error decoding JSON from {json_file}.")
-        return None
-
-
-def load_model_dict(file_path):
-    """Load a model from a file"""
-    try:
-        return torch.load(file_path, map_location=DEVICE)
-    except (FileNotFoundError, RuntimeError) as e:
-        logger.error(f"Error loading model from {file_path}: {e}")
-        return None
-
-
-def compute_loss_func(outputs, labels, num_items_in_batch):
-    """Compute the MSE loss function for the model"""
-    predictions = outputs["predictions"]
-    return torch.mean((predictions - labels)**2)
-
-
-def get_example_data():
-    """Return example data for testing when the real dataset is not available"""
-    logger.info("Using example data for testing")
-    return [
-        {
-            "smiles": "CCN(CC)c1ccc2c(c1)O[B-](c1ccccc1)(c1ccccc1)[N+](c1ccccc1)=C2",
-            "ET(30)": 37.4,
-            "dielectic constant": 7.6,
-            "dipole moment": 1.75,
-            "wavelength": 790,
-            "TPACS": 41,
-            "TPACS_log": 1.6127838567197355
-        },
-        {
-            "smiles": "CCN(CC)c1ccc2cc(N(CC)CC)ccc2c1",
-            "ET(30)": 45.6,
-            "dielectic constant": 32.7,
-            "dipole moment": 1.84,
-            "wavelength": 800,
-            "TPACS": 75,
-            "TPACS_log": 1.8750612633917
-        },
-        {
-            "smiles": "CCN(CC)c1ccc2c(c1)SC1=CC=C(N(CC)CC)C=C21",
-            "ET(30)": 40.2,
-            "dielectic constant": 20.4,
-            "dipole moment": 1.92,
-            "wavelength": 810,
-            "TPACS": 110,
-            "TPACS_log": 2.0413926851582249
-        }
-    ]
-
-
-def train_model(model, train_loader, val_loader, output_dir, num_epochs, learning_rate):
-    """Train the MolFormerTPA model using transformer.Trainer"""
-    # Create output directory if it does not exist
-    os.makedirs(output_dir, exist_ok=True)
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="TPA Prediction with MolFormer")
+    parser.add_argument("--data_path", type=str, default="TPA_cleaned_data.json", 
+                        help="Path to the TPA data JSON file")
+    parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR,
+                        help="Output directory")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,
+                        help="Batch size for training and evaluation")
+    parser.add_argument("--learning_rate", type=float, default=LEARNING_RATE,
+                        help="Initial learning rate")
+    parser.add_argument("--phase1_epochs", type=int, default=FROZEN_NUM_EPOCHS,
+                        help="Number of epochs for phase 1 (frozen backbone)")
+    parser.add_argument("--phase2_epochs", type=int, default=FT_NUM_EPOCHS,
+                        help="Number of epochs for phase 2 (fine-tuning)")
+    parser.add_argument("--use_augmentation", action="store_true",
+                        help="Use SMILES augmentation during training")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="Early stopping patience")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Disable Weights & Biases logging")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Run only evaluation on test set using a saved model")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Path to saved model (for eval_only mode)")
     
-    # Set up training arguments
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=train_loader.batch_size,
-        per_device_eval_batch_size=val_loader.batch_size,
-        eval_strategy="steps",
-        eval_steps=EVAL_STEPS,
-        logging_steps=LOGGING_STEPS,
-        save_steps=SAVE_STEPS,
-        report_to="wandb",
-        logging_dir=LOGGING_DIR,
-        load_best_model_at_end=True,
-        fp16=USE_MIXED_PRECISION,
-        save_safetensors=False,
-        learning_rate=learning_rate,
-        seed=RANDOM_SEED,
-        dataloader_num_workers=0,
-        gradient_accumulation_steps=1,
-        warmup_steps=0,
-        weight_decay=0.0
-    )
-    
-    # Create the Trainer instance
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_loader.dataset,
-        eval_dataset=val_loader.dataset,
-        compute_loss_func=compute_loss_func,
-    )
-    
-    # Check for existing checkpoints
-    last_checkpoint = get_last_checkpoint(output_dir)
-    if last_checkpoint:
-        logger.info(f"Found checkpoint: {last_checkpoint}")
-        logger.info("Starting fresh training instead of resuming")
-    
-    trainer.train()
-    
-    # Evaluate on the validation set
-    eval_results = trainer.evaluate()
-    logger.info(f"Evaluation results: {eval_results}")
-    
-    return output_dir
+    return parser.parse_args()
 
 
 def main():
-    """Main function to train and evaluate the model"""
-    # Set seed for reproducibility
+    """Main entry point"""
+    args = parse_args()
+    
     torch.manual_seed(RANDOM_SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_SEED)
     
-    # Create required directories
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Load data from JSON file
-    data_file = "TPA_cleaned_data.json"
-    all_data = load_data(data_file) or get_example_data()
+    with open(os.path.join(args.output_dir, "args.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
     
-    logger.info(f"Loaded {len(all_data)} data points")
-
-    # Split data into training and validation sets
-    train_data, val_data = train_test_split(all_data, test_size=0.2, random_state=RANDOM_SEED)
-    logger.info(f"Training set: {len(train_data)} samples, Validation set: {len(val_data)} samples")
-
-    # Create datasets
-    train_dataset = TPADataset(train_data, is_train=True)
-    val_dataset = TPADataset(val_data, is_train=False)
-
-    # Set the scaler for validation dataset from training dataset
-    val_dataset.set_scaler(train_dataset.scaler)
-
-    # Create data loaders
+    data = load_data(args.data_path) or get_example_data()
+    logger.info(f"Loaded {len(data)} data points")
+    
+    if not args.no_wandb:
+        wandb.init(
+            project="tpa-prediction",
+            config=vars(args)
+        )
+    
+    # Stratified split
+    def get_tpa_bin(item):
+        tpa = item.get('TPACS_log', 0)
+        if tpa < 1.5:
+            return 0
+        elif tpa < 2.0:
+            return 1
+        elif tpa < 2.5:
+            return 2
+        else:
+            return 3
+    
+    for item in data:
+        item['tpa_bin'] = get_tpa_bin(item)
+    
+    train_data, temp_data = train_test_split(
+        data, 
+        test_size=0.3, 
+        random_state=RANDOM_SEED,
+        stratify=[item['tpa_bin'] for item in data]
+    )
+    
+    val_data, test_data = train_test_split(
+        temp_data, 
+        test_size=0.5, 
+        random_state=RANDOM_SEED,
+        stratify=[item['tpa_bin'] for item in temp_data]
+    )
+    
+    logger.info(f"Training: {len(train_data)}, Validation: {len(val_data)}, Test: {len(test_data)}")
+    
+    train_dataset = TPADataset(
+        train_data, 
+        is_train=True, 
+        use_augmentation=args.use_augmentation
+    )
+    
+    val_dataset = TPADataset(
+        val_data, 
+        is_train=False, 
+        scaler=train_dataset.scaler
+    )
+    
+    test_dataset = TPADataset(
+        test_data, 
+        is_train=False, 
+        scaler=train_dataset.scaler
+    )
+    
     pin_memory = torch.cuda.is_available()
     
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=BATCH_SIZE, 
+        batch_size=args.batch_size, 
         shuffle=True, 
-        num_workers=0,
+        num_workers=0,  # Use 0 to avoid multiprocessing issues with tokenizers
         pin_memory=pin_memory
     )
     
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         num_workers=0,
         pin_memory=pin_memory
     )
     
-    # Initialize model with condition dimension (wavelength + 3 solvent properties)
-    condition_dim = 4  # wavelength, ET(30), dielectric constant, dipole moment
-    model = MolFormerTPA(condition_dim=condition_dim, use_mixed_precision=USE_MIXED_PRECISION).to(DEVICE)
-
-    # Check if CUDA is available
-    if torch.cuda.is_available():
-        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        logger.info("CUDA not available, using CPU")
-
-    # Initialize wandb
-    wandb.init(
-        project="my-transformer-training",
-        reinit=True
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=args.batch_size,
+        num_workers=0,
+        pin_memory=pin_memory
     )
-
+    
+    # Initialize model
+    condition_dim = 4  # wavelength, ET(30), dielectric constant, dipole moment
+    model = MolFormerTPA(
+        condition_dim=condition_dim, 
+        use_mixed_precision=USE_MIXED_PRECISION
+    ).to(DEVICE)
+    
+    # Eval only mode
+    if args.eval_only:
+        if args.model_path is None:
+            logger.error("Model path must be provided in eval_only mode")
+            return
+        
+        logger.info(f"Loading model from {args.model_path}")
+        model.load_state_dict(torch.load(args.model_path, map_location=DEVICE))
+        
+        logger.info("Evaluating model on test set")
+        metrics, predictions, labels = evaluate_model(model, test_loader)
+        
+        for key, value in metrics.items():
+            logger.info(f"Test {key}: {value:.4f}")
+            if not args.no_wandb:
+                wandb.log({f"test_{key}": value})
+        
+        # Save predictions
+        import numpy as np
+        predictions_file = os.path.join(args.output_dir, "test_predictions.npz")
+        np.savez(
+            predictions_file, 
+            predictions=predictions, 
+            labels=labels,
+            metrics=np.array([metrics])
+        )
+        logger.info(f"Test predictions saved to {predictions_file}")
+        
+        if not args.no_wandb:
+            wandb.finish()
+        
+        return
+    
+    # Training mode
     # Phase 1: Training with frozen MolFormer
     logger.info("Starting Phase 1: Training with frozen MolFormer")
     model.change_molformer(train_molformer=False)
-    phase1_output = os.path.join(OUTPUT_DIR, "phase1")
-    train_model(
+    phase1_output = os.path.join(args.output_dir, "phase1")
+    
+    best_phase1_model_path = train_with_early_stopping(
         model, 
         train_loader, 
         val_loader, 
         output_dir=phase1_output,
-        learning_rate=LEARNING_RATE, 
-        num_epochs=FROZEN_NUM_EPOCHS
+        learning_rate=args.learning_rate, 
+        num_epochs=args.phase1_epochs,
+        patience=args.patience
     )
-
-    # Load the best model from Phase 1
-    model_checkpoint = get_last_checkpoint(phase1_output)
-    if model_checkpoint:
-        trained_model_path = os.path.join(model_checkpoint, "pytorch_model.bin")
-        model_dict = load_model_dict(trained_model_path)
-        if model_dict:
-            model.load_state_dict(model_dict)
-            logger.info(f"Loaded best model from Phase 1: {trained_model_path}")
-        else:
-            logger.warning("Could not load best model from Phase 1, continuing with current model")
+    
+    # Load best model from Phase 1
+    if best_phase1_model_path and os.path.exists(best_phase1_model_path):
+        model.load_state_dict(torch.load(best_phase1_model_path))
+        logger.info(f"Loaded best model from Phase 1: {best_phase1_model_path}")
     else:
-        logger.warning("No checkpoint found after Phase 1")
-
+        logger.warning("No best model found after Phase 1")
+    
     # Phase 2: Fine-tuning with unfrozen MolFormer
     logger.info("Starting Phase 2: Fine-tuning with unfrozen MolFormer")
     model.change_molformer(train_molformer=True)
-    phase2_output = os.path.join(OUTPUT_DIR, "phase2")
-    train_model(
+    phase2_output = os.path.join(args.output_dir, "phase2")
+    
+    best_phase2_model_path = train_with_early_stopping(
         model, 
         train_loader, 
         val_loader, 
         output_dir=phase2_output,
-        learning_rate=LEARNING_RATE/10, 
-        num_epochs=FT_NUM_EPOCHS
+        learning_rate=args.learning_rate / 10,  # Reduced learning rate for fine-tuning
+        num_epochs=args.phase2_epochs,
+        patience=args.patience
     )
-
-    # Save the final model
-    final_model_path = os.path.join(OUTPUT_DIR, "final_model.pt")
+    
+    # Load best model from Phase 2
+    if best_phase2_model_path and os.path.exists(best_phase2_model_path):
+        model.load_state_dict(torch.load(best_phase2_model_path))
+        logger.info(f"Loaded best model from Phase 2: {best_phase2_model_path}")
+    else:
+        logger.warning("No best model found after Phase 2, using last model state")
+    
+    # Evaluate on test set
+    logger.info("Evaluating model on test set")
+    metrics, predictions, labels = evaluate_model(model, test_loader)
+    
+    for key, value in metrics.items():
+        logger.info(f"Test {key}: {value:.4f}")
+        if not args.no_wandb:
+            wandb.log({f"test_{key}": value})
+    
+    # Save final model
+    final_model_path = os.path.join(args.output_dir, "final_model.pt")
     torch.save(model.state_dict(), final_model_path)
     logger.info(f"Final model saved to {final_model_path}")
-
-    # Finish the wandb run
-    wandb.finish()
-
-    logger.info("Model training complete")
+    
+    # Save predictions
+    import numpy as np
+    predictions_file = os.path.join(args.output_dir, "test_predictions.npz")
+    np.savez(
+        predictions_file, 
+        predictions=predictions, 
+        labels=labels,
+        metrics=np.array([metrics])
+    )
+    logger.info(f"Test predictions saved to {predictions_file}")
+    
+    # Sample prediction
+    logger.info("Running sample prediction")
+    sample_smiles = test_data[0]["smiles"]
+    sample_wavelength = test_data[0]["wavelength"]
+    sample_et30 = test_data[0]["ET(30)"]
+    sample_dielectric = test_data[0]["dielectic constant"]
+    sample_dipole = test_data[0]["dipole moment"]
+    
+    sample_pred = predict_tpacs(
+        model,
+        [sample_smiles],
+        sample_wavelength,
+        sample_et30,
+        sample_dielectric,
+        sample_dipole,
+        scaler=train_dataset.scaler
+    )
+    
+    logger.info(f"Sample SMILES: {sample_smiles}")
+    logger.info(f"Sample conditions: wavelength={sample_wavelength}, ET(30)={sample_et30}, " +
+                f"dielectric={sample_dielectric}, dipole={sample_dipole}")
+    logger.info(f"Predicted TPA (log): {sample_pred[0][0]:.4f}")
+    logger.info(f"Actual TPA (log): {test_data[0]['TPACS_log']:.4f}")
+    
+    if not args.no_wandb:
+        wandb.finish()
+    
+    logger.info("Training and evaluation complete!")
 
 
 if __name__ == "__main__":

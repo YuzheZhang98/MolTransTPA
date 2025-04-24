@@ -1,8 +1,12 @@
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 from constants import MOLFORMER_PATH
+import os
+
+# Set environment variable to avoid tokenizers warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def validate_dataset(data_list):
@@ -44,63 +48,108 @@ def validate_dataset(data_list):
    
     return valid_data, report
 
-class TPADataset(Dataset):
-    def __init__(self, data_list, is_train=True, scaler=None):
-        """
-        Dataset for two-photon absorption prediction without using a tokenizer.
-        All numerical parameters (e.g. wavelength and solvent properties) are combined
-        into a single condition vector.
 
+def smiles_augmentation(smiles_list, num_augmentations=2):
+    """
+    Perform SMILES augmentation by generating multiple valid SMILES
+    for the same molecule using RDKit.
+    
+    Args:
+        smiles_list (list): List of SMILES strings
+        num_augmentations (int): Number of augmentations per molecule
+        
+    Returns:
+        dict: Mapping of original SMILES to list of augmented SMILES
+    """
+    import random
+    from rdkit import Chem
+    
+    augmented_data = {}
+    for smiles in smiles_list:
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                augmented_data[smiles] = [smiles]  # Keep original if parsing fails
+                continue
+                
+            augmented = [smiles]
+            for _ in range(num_augmentations):
+                # Generate random SMILES for the same molecule
+                rand_smiles = Chem.MolToSmiles(mol, doRandom=True, isomericSmiles=True)
+                if rand_smiles != smiles and rand_smiles not in augmented:
+                    augmented.append(rand_smiles)
+            
+            augmented_data[smiles] = augmented
+        except Exception as e:
+            print(f"Error augmenting SMILES {smiles}: {str(e)}")
+            augmented_data[smiles] = [smiles]  # Fallback to original
+            
+    return augmented_data
+
+
+class TPADataset(Dataset):
+    def __init__(self, data_list, is_train=True, scaler=None, use_augmentation=False):
+        """
+        Enhanced TPADataset with SMILES augmentation option
+        
         Args:
-            data_list (list): List of dictionaries. Each dictionary should contain:
-                              - "smiles": SMILES string (retained for reference)
-                              - "wavelength": Excitation wavelength (numerical)
-                              - "ET(30)": A solvent property (numerical)
-                              - "dielectic constant": A solvent property (numerical)
-                              - "dipole moment": A solvent property (numerical)
-                              - "TPACS_log" or "TPACS": The target TPA value 
-            is_train (bool): Whether the dataset is for training (scaling is fitted) or not.
-            scaler (StandardScaler or None): Optionally provide a pre-fitted scaler.
+            data_list (list): List of data dictionaries
+            is_train (bool): Whether dataset is for training
+            scaler (StandardScaler): Optional pre-fitted scaler
+            use_augmentation (bool): Whether to use SMILES augmentation
         """
         # Validate dataset first
         valid_data, report = validate_dataset(data_list)
-       
+        
         if len(valid_data) < len(data_list):
             print(f"Filtered {report['filtered']} invalid entries from dataset. Issues: {report['issues']}")
-           
+            
         if not valid_data:
             raise ValueError("No valid data entries after validation!")
-       
+        
         self.tokenizer = AutoTokenizer.from_pretrained(MOLFORMER_PATH, padding=True, trust_remote_code=True)
-        self.data = valid_data
+        self.original_data = valid_data
         self.is_train = is_train
+        self.use_augmentation = use_augmentation and is_train  # Only use augmentation for training
+        
+        # Apply SMILES augmentation if enabled
+        if self.use_augmentation:
+            self.smiles_list = []
+            self.augmented_indices = []  # Maps augmented index to original data index
+            
+            original_smiles = [item['smiles'] for item in valid_data]
+            augmented_smiles_dict = smiles_augmentation(original_smiles)
+            
+            for idx, item in enumerate(valid_data):
+                orig_smiles = item['smiles']
+                for aug_smiles in augmented_smiles_dict.get(orig_smiles, [orig_smiles]):
+                    self.smiles_list.append(aug_smiles)
+                    self.augmented_indices.append(idx)
+            
+            print(f"Augmented dataset from {len(valid_data)} to {len(self.smiles_list)} samples")
+        else:
+            self.smiles_list = [item['smiles'] for item in valid_data]
+            self.augmented_indices = list(range(len(valid_data)))
 
-        self.smiles_list = [item['smiles'] for item in valid_data]
-
-        # Tokenize SMILES strings
-        self.smiles_tokens = self.tokenizer(
-            self.smiles_list,
-            padding=True,
-            return_tensors='pt'
-        )
-
-        # Create condition data using all numerical parameters.
+        # Create condition data using all numerical parameters
         self.condition_data = np.array([
             [
-                item['wavelength'],
-                item['ET(30)'],
-                item['dielectic constant'],
-                item['dipole moment']
+                valid_data[self.augmented_indices[i]]['wavelength'],
+                valid_data[self.augmented_indices[i]]['ET(30)'],
+                valid_data[self.augmented_indices[i]]['dielectic constant'],
+                valid_data[self.augmented_indices[i]]['dipole moment']
             ]
-            for item in data_list
+            for i in range(len(self.smiles_list))
         ], dtype=np.float32)
 
-        # Extract target values. Use 'TPACS_log'
-        self.tpa_values = np.array([item['TPACS_log'] for item in data_list], dtype=np.float32)
-
-        # Setup the scaler for the condition data
+        # Extract target values
+        self.tpa_values = np.array([
+            valid_data[self.augmented_indices[i]]['TPACS_log'] 
+            for i in range(len(self.smiles_list))
+        ], dtype=np.float32)
+        
+        # Handle scaling as before
         if is_train:
-            # If no scaler is provided, fit a new one on the condition data.
             if scaler is None:
                 from sklearn.preprocessing import StandardScaler
                 self.scaler = StandardScaler().fit(self.condition_data)
@@ -108,13 +157,20 @@ class TPADataset(Dataset):
                 self.scaler = scaler
             self.scaled_conditions = self.scaler.transform(self.condition_data)
         else:
-            # For validation or test, either a scaler must be provided or it must be set later.
             if scaler is not None:
                 self.scaler = scaler
                 self.scaled_conditions = self.scaler.transform(self.condition_data)
             else:
-                # Use raw condition values until an external scaler is applied.
                 self.scaled_conditions = self.condition_data
+        
+        # Pre-tokenize all SMILES
+        self.tokenized_smiles = self.tokenizer(
+            self.smiles_list,
+            padding='max_length',
+            truncation=True,
+            max_length=512,
+            return_tensors='pt'
+        )
 
     def set_scaler(self, scaler):
         """
@@ -127,26 +183,21 @@ class TPADataset(Dataset):
         self.scaled_conditions = self.scaler.transform(self.condition_data)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.smiles_list)
 
     def __getitem__(self, idx):
         """
-        Returns a dictionary with:
-            - 'input_ids': tokenized SMILES string
-            - 'attention_mask': Attention mask for the tokenized SMILES
-            - 'condition': Scaled condition tensor including all numerical parameters
-            - 'tpa': Target TPA value as a tensor
+        Returns a dictionary with model inputs and targets.
         """
-        # Convert the condition vector to torch tensor
+        # Get tokenized SMILES
+        input_ids = self.tokenized_smiles['input_ids'][idx]
+        attention_mask = self.tokenized_smiles['attention_mask'][idx]
+
+        # Get condition vector
         condition = torch.tensor(self.scaled_conditions[idx], dtype=torch.float32)
 
         # Get target value
-        tpa = torch.tensor(self.tpa_values[idx], dtype=torch.float32)
-
-        
-        smiles_token = self.smiles_tokens[idx]
-        input_ids = smiles_token.ids
-        attention_mask = smiles_token.attention_mask
+        tpa = torch.tensor(self.tpa_values[idx], dtype=torch.float32).unsqueeze(0)
 
         return {
             'input_ids': input_ids,

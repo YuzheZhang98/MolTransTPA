@@ -27,7 +27,6 @@ LOGGING_STEPS = 10
 EVAL_STEPS = 250
 SAVE_STEPS = 250
 
-# Set up logging
 try:
     os.makedirs(LOGGING_DIR, exist_ok=True)
     logging.basicConfig(
@@ -39,7 +38,6 @@ try:
         ]
     )
 except Exception:
-    # Fallback to basic logging if file cannot be created
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -118,7 +116,7 @@ def create_lr_scheduler(optimizer, num_warmup_steps, num_training_steps):
     from transformers import get_scheduler
     
     return get_scheduler(
-        name="linear",  # Use the valid scheduler type
+        name="linear",
         optimizer=optimizer,
         num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps
@@ -142,7 +140,6 @@ def train_with_early_stopping(model, train_loader, val_loader, output_dir,
     Returns:
         str: Path to best model
     """
-    # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
     # Create optimizer with weight decay for non-bias parameters
@@ -183,14 +180,11 @@ def train_with_early_stopping(model, train_loader, val_loader, output_dir,
         start_time = time.time()
         
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)"):
-            # Move batch to device
             batch = {k: v.to(DEVICE) for k, v in batch.items()}
             
-            # Forward pass
             outputs = model(**batch)
             loss = outputs["loss"]
             
-            # Backward pass and optimization
             optimizer.zero_grad()
             loss.backward()
             
@@ -222,7 +216,6 @@ def train_with_early_stopping(model, train_loader, val_loader, output_dir,
         
         avg_val_loss = val_loss / len(val_loader)
         
-        # Calculate R² score
         from sklearn.metrics import r2_score
         r2 = r2_score(np.array(all_labels), np.array(all_preds))
         
@@ -326,21 +319,17 @@ def evaluate_model(model, test_loader):
 
 def main():
     """Improved main function for training and evaluation"""
-    # Set seed for reproducibility
     torch.manual_seed(RANDOM_SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_SEED)
     
-    # Create required directories
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Load data from JSON file
     data_file = "TPA_cleaned_data.json"
     all_data = load_data(data_file) or get_example_data()
     
     logger.info(f"Loaded {len(all_data)} data points")
 
-    # Stratified split based on TPA ranges
     def get_tpa_bin(item):
         tpa = item.get('TPACS_log', 0)
         if tpa < 1.5:
@@ -352,14 +341,11 @@ def main():
         else:
             return 3
     
-    # Add bin information for stratified split
     for item in all_data:
         item['tpa_bin'] = get_tpa_bin(item)
     
-    # Stratified split
     from sklearn.model_selection import train_test_split
     
-    # First split into train and temp sets
     train_data, temp_data = train_test_split(
         all_data, 
         test_size=0.3, 
@@ -367,7 +353,6 @@ def main():
         stratify=[item['tpa_bin'] for item in all_data]
     )
     
-    # Then split temp into validation and test
     val_data, test_data = train_test_split(
         temp_data, 
         test_size=0.5, 
@@ -377,37 +362,35 @@ def main():
     
     logger.info(f"Training: {len(train_data)}, Validation: {len(val_data)}, Test: {len(test_data)}")
 
-    # Create datasets with augmentation for training
     train_dataset = TPADataset(train_data, is_train=True, use_augmentation=True)
     val_dataset = TPADataset(val_data, is_train=False, scaler=train_dataset.scaler)
     test_dataset = TPADataset(test_data, is_train=False, scaler=train_dataset.scaler)
 
-    # Create data loaders
     pin_memory = torch.cuda.is_available()
     
     train_loader = DataLoader(
         train_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=0,  # Use 0 to avoid multiprocessing issues with tokenizers
+        num_workers=0,
         pin_memory=pin_memory
     )
     
     val_loader = DataLoader(
         val_dataset, 
         batch_size=BATCH_SIZE,
-        num_workers=0,  # Use 0 to avoid multiprocessing issues with tokenizers
+        num_workers=0,
         pin_memory=pin_memory
     )
     
     test_loader = DataLoader(
         test_dataset, 
         batch_size=BATCH_SIZE,
-        num_workers=0,  # Use 0 to avoid multiprocessing issues with tokenizers
+        num_workers=0,
         pin_memory=pin_memory
     )
     
-    # Initialize improved model
+    # Initialize
     condition_dim = 4  # wavelength, ET(30), dielectric constant, dipole moment
     model = MolFormerTPA(
         condition_dim=condition_dim, 
@@ -540,7 +523,6 @@ def main():
                     all_uncertainties.extend(outputs["uncertainty"].cpu().numpy())
                     all_labels.extend(batch["labels"].cpu().numpy())
             
-            # Calculate metrics
             from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
             
             all_preds = np.array(all_preds).flatten()
@@ -562,16 +544,13 @@ def main():
             
             return metrics, all_preds, all_labels, all_uncertainties
         
-        # Evaluate ensemble
         ensemble_metrics, ensemble_preds, ensemble_labels, ensemble_uncertainties = evaluate_ensemble(ensemble, test_loader)
         
-        # Log ensemble metrics
         logger.info("Ensemble performance:")
         for key, value in ensemble_metrics.items():
             logger.info(f"Ensemble {key}: {value:.4f}")
             wandb.log({f"ensemble_{key}": value})
         
-        # Save ensemble predictions
         ensemble_file = os.path.join(OUTPUT_DIR, "ensemble_predictions.npz")
         np.savez(
             ensemble_file, 
@@ -582,7 +561,6 @@ def main():
         )
         logger.info(f"Ensemble predictions saved to {ensemble_file}")
     
-    # Finish wandb run
     wandb.finish()
     
     logger.info("Training and evaluation complete!")
